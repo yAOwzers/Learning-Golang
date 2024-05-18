@@ -7,6 +7,7 @@ import (
 	"time"
 	"url-shortener/database"
 	"url-shortener/helpers"
+	"url-shortener/log"
 
 	"github.com/asaskevich/govalidator"
 	"github.com/go-redis/redis/v8"
@@ -14,23 +15,28 @@ import (
 )
 
 type request struct {
-	URL         string
-	CustomShort string
+	URL         string        `json:"url"`
+	CustomShort string        `json:"short"`
+	Expiry      time.Duration `json:"expiry"`
 }
 
 type response struct {
-	URL             string
-	CustomShort     string
-	XRateRemaining  int
-	XRateLimitReset time.Duration
+	URL             string        `json:"url"`
+	CustomShort     string        `json:"short"`
+	Expiry          time.Duration `json:"expiry"`
+	XRateRemaining  int           `json:"rate_limit"`
+	XRateLimitReset time.Duration `json:"rate_limit_reset"`
 }
 
 func Shorten(ctx *fiber.Ctx) error {
 	body := &request{}
+
 	if err := ctx.BodyParser(&body); err != nil {
+		log.Warn().Msgf("Issue with parsing JSON from request, body: &v", body)
 		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cannot parse JSON"})
 	}
 
+	// Implement Rate limiting
 	r2 := database.CreateClient(1)
 	defer r2.Close()
 
@@ -38,11 +44,9 @@ func Shorten(ctx *fiber.Ctx) error {
 	limit, _ := r2.TTL(database.Ctx, ctx.IP()).Result()
 
 	if err == redis.Nil {
-		// set quota for the current IP Address
 		_ = r2.Set(database.Ctx, ctx.IP(), os.Getenv("API_QUOTA"), 30*60*time.Second).Err()
 	} else if err == nil {
 		valInt, _ := strconv.Atoi(val)
-		// If Quota exceeded
 		if valInt <= 0 {
 			return ctx.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error":            "Rate limit exceeded",
@@ -51,14 +55,15 @@ func Shorten(ctx *fiber.Ctx) error {
 		}
 	}
 
-	// check if the input is an actual url
+	// check if the input is an actual URL
 
 	if !govalidator.IsURL(body.URL) {
 		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid URL"})
 	}
 
+	// check for domain error
 	if !helpers.RemoveDomainError(body.URL) {
-		return ctx.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Can't do that"})
+		return ctx.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Can't do that :)"})
 	}
 
 	// enforce HTTPS, SSL
@@ -82,9 +87,14 @@ func Shorten(ctx *fiber.Ctx) error {
 		})
 	}
 
-	err = r.Set(database.Ctx, id, body.URL, 0).Err()
+	if body.Expiry == 0 {
+		body.Expiry = 24
+	}
+
+	err = r.Set(database.Ctx, id, body.URL, body.Expiry*3600*time.Second).Err()
 
 	if err != nil {
+		log.Warn().Msgf("Unable to connect to server, err: %v", err)
 		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Unable to connect to server",
 		})
@@ -92,6 +102,7 @@ func Shorten(ctx *fiber.Ctx) error {
 
 	defaultAPIQuotaStr := os.Getenv("API_QUOTA")
 	if err != nil {
+		log.Warn().Msgf("Unable to connect to server, err: %v", err)
 		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Unable to connect to server",
 		})
@@ -100,11 +111,13 @@ func Shorten(ctx *fiber.Ctx) error {
 	resp := response{
 		URL:             body.URL,
 		CustomShort:     "",
+		Expiry:          body.Expiry,
 		XRateRemaining:  defaultApiQuota,
 		XRateLimitReset: 30,
 	}
 
 	remainingQuota, err := r2.Decr(database.Ctx, ctx.IP()).Result()
+	log.Debug().Msgf("Remaining quota: %v", remainingQuota)
 
 	resp.XRateRemaining = int(remainingQuota)
 	resp.XRateRemaining = int(limit / time.Nanosecond / time.Minute)
